@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Cookie Chomp">
+<title>Cookie Chomp</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#faf2e0;font-family:-apple-system,system-ui,sans-serif;
+    touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #hud{position:fixed;left:0;right:0;top:calc(env(safe-area-inset-top) + 12px);text-align:center;pointer-events:none;color:#333}
+  #time{font:900 36px ui-monospace,Menlo,monospace}
+  #status{font-weight:600;color:#777;margin:4px 0 8px}
+  button{pointer-events:auto;font:600 15px -apple-system,system-ui;border:0;border-radius:10px;padding:8px 14px;margin:0 4px;
+    background:#e8dcc4;color:#333}
+  #msg{position:fixed;left:0;right:0;bottom:calc(env(safe-area-inset-bottom) + 70px);text-align:center;
+    font-weight:800;font-size:22px;white-space:pre-line;pointer-events:none;color:#333}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="time">0.00 s</div>
+  <div id="status">Cookie Chomp</div>
+  <button id="mode"></button><button id="place"></button>
+</div>
+<div id="msg"></div>
+<script>
+// Fully offline: no network requests. Best time and joystick spot are stored on this device only.
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
+// 5 levels: unit-space shape tests (x, y in -1..1, y points down)
+const SHAPES = [
+  ["Circle",   (x, y) => x * x + y * y <= 1],
+  ["Square",   (x, y) => Math.abs(x) <= 0.85 && Math.abs(y) <= 0.85],
+  ["Triangle", (x, y) => y >= -0.9 && y <= 0.85 && Math.abs(x) <= (y + 0.9) * 0.55],
+  ["Star",     (x, y) => Math.hypot(x, y) <= 0.4 + 0.55 * Math.cos(2.5 * (Math.atan2(y, x) + Math.PI / 2)) ** 2],
+  ["Heart",    (x, y) => { const X = x * 1.25, Y = -y * 1.25 + 0.25; return (X * X + Y * Y - 1) ** 3 - X * X * Y ** 3 <= 0; }]
+];
+
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+let W = 0, H = 0;
+function resize() {
+  const d = devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  cv.width = W * d; cv.height = H * d; g.setTransform(d, 0, 0, d, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+let state = "ready", level = 0, crumbs = [], cell = 10, pos = { x: 0, y: 0 };
+let target = null, joy = { x: 0, y: 0 }, t0 = 0, last = 0, lastBite = -1e9, elapsed = 0;
+let best = store.get("best", 0), newRecord = false;
+let useJoy = store.get("useJoy", false), jp = store.get("jp", null), placing = false;
+const joyPoint = () => jp || { x: 100, y: H - 140 };
+
+function start(now) { state = "playing"; level = 0; t0 = now; elapsed = 0; newRecord = false; load(); }
+
+function load() {
+  const n = 11, R = Math.min(W, H) * 0.42, cx = W / 2, cy = H / 2, inside = SHAPES[level][1];
+  cell = R / n; crumbs = [];
+  for (let i = -n; i <= n; i++) for (let j = -n; j <= n; j++)
+    if (inside(i / n, j / n)) crumbs.push({ x: cx + i * cell, y: cy + j * cell, chip: Math.random() < 1 / 6 });
+  pos = { x: W / 2, y: H - 90 };
+}
+
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  if (state !== "playing") return;
+  elapsed = (now - t0) / 1000;
+  const speed = 240;
+  let mx = joy.x * speed * dt, my = joy.y * speed * dt;
+  if (target) {
+    const dx = target.x - pos.x, dy = target.y - pos.y, l = Math.max(Math.hypot(dx, dy), 0.001);
+    const s = Math.min(speed * dt, l) / l; mx = dx * s; my = dy * s;
+  }
+  pos.x = Math.min(Math.max(pos.x + mx, 30), W - 30);
+  pos.y = Math.min(Math.max(pos.y + my, 30), H - 30);
+  const before = crumbs.length;
+  crumbs = crumbs.filter(c => Math.hypot(c.x - pos.x, c.y - pos.y) >= 30);
+  if (crumbs.length < before) lastBite = now;
+  if (!crumbs.length) {
+    if (++level < SHAPES.length) load();
+    else {
+      state = "done";
+      if (!best || elapsed < best) { best = elapsed; newRecord = true; store.set("best", best); }
+    }
+  }
+}
+
+function px(o, x, y, w, h, c) { g.fillStyle = c; g.fillRect(o.x + x * 5, o.y + y * 5, w * 5, h * 5); }
+
+// Pixel critter on a 12x9 grid, 5px pixels
+function drawCharacter(now) {
+  const o = { x: pos.x - 30, y: pos.y - 22 }, orange = "#d97857";
+  px(o, 1, 0, 10, 7, orange);                         // body
+  px(o, 0, 3, 1, 2, orange); px(o, 11, 3, 1, 2, orange); // arms
+  for (const x of [2, 4, 7, 9]) px(o, x, 7, 1, 2, orange); // legs
+  px(o, 3, 1, 1, 2, "#000"); px(o, 8, 1, 1, 2, "#000");   // eyes
+  const open = now - lastBite < 300 && Math.floor(now / 83) % 2 === 0 ? 3 : 1;
+  px(o, 2, 4, 8, open, "#000");                        // big mouth
+}
+
+function draw(now) {
+  g.clearRect(0, 0, W, H);
+  for (const c of crumbs) {
+    g.fillStyle = c.chip ? "#59331a" : "#cc8f4d";
+    g.fillRect(c.x - cell / 2, c.y - cell / 2, cell + 0.5, cell + 0.5);
+  }
+  if (state !== "ready") drawCharacter(now);
+  if (useJoy) {
+    const p = joyPoint();
+    g.strokeStyle = g.fillStyle = "rgba(128,128,128,.5)"; g.lineWidth = 3;
+    g.beginPath(); g.arc(p.x, p.y, 60, 0, 7); g.stroke();
+    g.beginPath(); g.arc(p.x + joy.x * 60, p.y + joy.y * 60, 25, 0, 7); g.fill();
+  }
+}
+
+function updateHud() {
+  $("time").textContent = elapsed.toFixed(2) + " s";
+  $("status").textContent = state === "playing" ? `Level ${level + 1}/5 · ${SHAPES[level][0]}` : "Cookie Chomp";
+  $("mode").textContent = useJoy ? "🕹 Joystick" : "☝️ Touch";
+  $("place").style.display = useJoy ? "" : "none";
+  $("place").textContent = placing ? "Tap a spot…" : "Move joystick";
+  const b = best ? `Best: ${best.toFixed(2)} s` : "No record yet";
+  $("msg").textContent = state === "playing" ? "" : state === "done"
+    ? `All cookies eaten in ${elapsed.toFixed(2)} s!\n${newRecord ? "🏆 NEW RECORD!" : b}\n\nTap to play again`
+    : `Tap to start\n${b}`;
+}
+
+function loop(now) { tick(now); draw(now); updateHud(); requestAnimationFrame(loop); }
+requestAnimationFrame(t => { last = t; loop(t); });
+
+$("mode").onclick = () => { useJoy = !useJoy; placing = false; store.set("useJoy", useJoy); };
+$("place").onclick = () => { placing = !placing; };
+
+let active = false, startPt = null;
+function steer(p) {
+  if (useJoy) {
+    const c = joyPoint();
+    if (Math.hypot(startPt.x - c.x, startPt.y - c.y) >= 90) return;
+    let dx = (p.x - c.x) / 60, dy = (p.y - c.y) / 60; const l = Math.hypot(dx, dy);
+    if (l > 1) { dx /= l; dy /= l; }
+    joy = { x: dx, y: dy };
+  } else target = p;
+}
+cv.addEventListener("pointerdown", e => {
+  const p = { x: e.clientX, y: e.clientY };
+  if (placing) { jp = p; store.set("jp", jp); placing = false; return; }
+  if (state !== "playing") { start(performance.now()); return; }
+  active = true; startPt = p; steer(p);
+});
+cv.addEventListener("pointermove", e => { if (active) steer({ x: e.clientX, y: e.clientY }); });
+const release = () => { active = false; joy = { x: 0, y: 0 }; target = null; };
+cv.addEventListener("pointerup", release);
+cv.addEventListener("pointercancel", release);
+document.addEventListener("touchmove", e => e.preventDefault(), { passive: false });
+</script>
+</body>
+</html>
